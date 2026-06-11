@@ -1,0 +1,661 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# create-dev-lxc.sh
+#
+# Public-safe Proxmox LXC dev-container bootstrap script.
+#
+# What it does:
+# - Creates a Debian 12 LXC container
+# - Installs updates and common tools
+# - Installs Docker, Git, GitHub CLI, Node.js, Claude Code, tmux
+# - Enables SSH
+# - Creates a non-root app user
+# - Creates /opt/<app-name>
+# - Makes the app user land in /opt/<app-name> on login
+# - Makes "claude" automatically run with --dangerously-skip-permissions for the app user
+# - Creates starter app folders
+# - Creates .gitignore, .env.example, README.md, docker-compose.yml
+# - Creates .github/workflows/claude.yml
+#
+# Run this ON THE PROXMOX HOST as root.
+#
+# Security note:
+# This script is meant for fast internal dev containers.
+# Do not expose password SSH directly to the public internet.
+
+echo "===================================================="
+echo " Proxmox Dev LXC Creator"
+echo "===================================================="
+echo
+
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: Run this script as root on the Proxmox host."
+    exit 1
+  fi
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "ERROR: Required command not found: $1"
+    exit 1
+  fi
+}
+
+prompt_secret_confirmed() {
+  local label="$1"
+  local first=""
+  local second=""
+
+  while true; do
+    read -rsp "$label: " first
+    echo
+    read -rsp "Confirm $label: " second
+    echo
+
+    if [[ -z "$first" ]]; then
+      echo "Password cannot be blank."
+      continue
+    fi
+
+    if [[ "$first" != "$second" ]]; then
+      echo "Passwords did not match. Try again."
+      continue
+    fi
+
+    printf '%s' "$first"
+    return 0
+  done
+}
+
+slugify_app_name() {
+  echo "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -cs 'a-z0-9' '-' \
+    | sed 's/^-//;s/-$//'
+}
+
+make_linux_username() {
+  local raw="$1"
+  local user
+  user="$(echo "$raw" | tr '-' '_' | tr -cs 'a-z0-9_' '_')"
+
+  if [[ ! "$user" =~ ^[a-z_] ]]; then
+    user="app_${user}"
+  fi
+
+  echo "$user" | cut -c1-31
+}
+
+require_root
+require_cmd pct
+require_cmd pvesm
+require_cmd pveam
+
+echo "Enter the basic container details."
+echo
+
+read -rp "Container ID, example 132: " CTID
+read -rp "App name, example fellowshiptext: " APP_NAME
+read -rp "GitHub repo URL, optional, example https://github.com/shrocktech/myapp.git: " REPO_URL
+
+if [[ ! "$CTID" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: Container ID must be a number."
+  exit 1
+fi
+
+APP_SLUG="$(slugify_app_name "$APP_NAME")"
+
+if [[ -z "$APP_SLUG" ]]; then
+  echo "ERROR: App name produced an empty slug."
+  exit 1
+fi
+
+HOSTNAME="$APP_SLUG"
+APP_USER="$(make_linux_username "$APP_SLUG")"
+APP_DIR="/opt/$APP_SLUG"
+
+echo
+echo "Default Proxmox settings are shown below."
+echo "Press Enter to accept the default, or type a new value."
+echo
+
+read -rp "Template storage [iso]: " TEMPLATE_STORAGE
+TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-iso}"
+
+read -rp "Container disk storage [ct-disks]: " DISK_STORAGE
+DISK_STORAGE="${DISK_STORAGE:-ct-disks}"
+
+read -rp "Network bridge [vnet0]: " BRIDGE
+BRIDGE="${BRIDGE:-vnet0}"
+
+read -rp "Debian template [debian-12-standard_12.12-1_amd64.tar.zst]: " TEMPLATE_NAME
+TEMPLATE_NAME="${TEMPLATE_NAME:-debian-12-standard_12.12-1_amd64.tar.zst}"
+
+read -rp "CPU cores [2]: " CPU_CORES
+CPU_CORES="${CPU_CORES:-2}"
+
+read -rp "RAM in MB [2048]: " MEMORY_MB
+MEMORY_MB="${MEMORY_MB:-2048}"
+
+read -rp "Swap in MB [1024]: " SWAP_MB
+SWAP_MB="${SWAP_MB:-1024}"
+
+read -rp "Disk size in GB [20]: " ROOTFS_SIZE
+ROOTFS_SIZE="${ROOTFS_SIZE:-20}"
+
+echo
+echo "Passwords:"
+echo
+
+ROOT_PASSWORD="$(prompt_secret_confirmed "Root password for container")"
+
+echo
+read -rp "Use the same password for app user '$APP_USER'? [Y/n]: " SAME_PASSWORD
+SAME_PASSWORD="${SAME_PASSWORD:-Y}"
+
+if [[ "$SAME_PASSWORD" =~ ^[Yy]$ ]]; then
+  APP_PASSWORD="$ROOT_PASSWORD"
+else
+  APP_PASSWORD="$(prompt_secret_confirmed "Password for app user '$APP_USER'")"
+fi
+
+echo
+read -rp "Enable root SSH password login? [Y/n]: " ENABLE_ROOT_SSH
+ENABLE_ROOT_SSH="${ENABLE_ROOT_SSH:-Y}"
+
+read -rp "Enable Proxmox console auto-login as root? [y/N]: " ENABLE_CONSOLE_AUTOLOGIN
+ENABLE_CONSOLE_AUTOLOGIN="${ENABLE_CONSOLE_AUTOLOGIN:-N}"
+
+echo
+echo "Git identity for the app user."
+read -rp "Git user.name [shrocktech]: " GIT_NAME
+GIT_NAME="${GIT_NAME:-shrocktech}"
+
+read -rp "Git user.email [technology@shrockservices.com]: " GIT_EMAIL
+GIT_EMAIL="${GIT_EMAIL:-technology@shrockservices.com}"
+
+echo
+echo "===================================================="
+echo " Planned Setup"
+echo "===================================================="
+echo "CT ID:              $CTID"
+echo "Hostname:           $HOSTNAME"
+echo "App name:           $APP_NAME"
+echo "App slug:           $APP_SLUG"
+echo "App user:           $APP_USER"
+echo "App directory:      $APP_DIR"
+echo "Repo URL:           ${REPO_URL:-none}"
+echo "Template storage:   $TEMPLATE_STORAGE"
+echo "Template:           $TEMPLATE_NAME"
+echo "Disk storage:       $DISK_STORAGE"
+echo "Disk size:          ${ROOTFS_SIZE}G"
+echo "Bridge:             $BRIDGE"
+echo "CPU cores:          $CPU_CORES"
+echo "RAM:                ${MEMORY_MB} MB"
+echo "Swap:               ${SWAP_MB} MB"
+echo "Root SSH login:     $ENABLE_ROOT_SSH"
+echo "Console auto-login: $ENABLE_CONSOLE_AUTOLOGIN"
+echo "Git name:           $GIT_NAME"
+echo "Git email:          $GIT_EMAIL"
+echo
+
+read -rp "Continue? Type yes: " CONFIRM
+if [[ "$CONFIRM" != "yes" ]]; then
+  echo "Cancelled."
+  exit 1
+fi
+
+if pct status "$CTID" >/dev/null 2>&1; then
+  echo "ERROR: CT $CTID already exists."
+  exit 1
+fi
+
+echo
+echo "=== Checking Proxmox storage ==="
+
+if ! pvesm status | awk 'NR>1 {print $1}' | grep -qx "$TEMPLATE_STORAGE"; then
+  echo "ERROR: Template storage '$TEMPLATE_STORAGE' not found."
+  pvesm status
+  exit 1
+fi
+
+if ! pvesm status | awk 'NR>1 {print $1}' | grep -qx "$DISK_STORAGE"; then
+  echo "ERROR: Disk storage '$DISK_STORAGE' not found."
+  pvesm status
+  exit 1
+fi
+
+echo
+echo "=== Updating Proxmox template list ==="
+pveam update
+
+echo
+echo "=== Downloading Debian template if needed ==="
+if ! pvesm list "$TEMPLATE_STORAGE" | grep -q "$TEMPLATE_NAME"; then
+  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME"
+else
+  echo "Template already exists."
+fi
+
+echo
+echo "=== Creating LXC container $CTID ==="
+
+pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE_NAME" \
+  --hostname "$HOSTNAME" \
+  --cores "$CPU_CORES" \
+  --memory "$MEMORY_MB" \
+  --swap "$SWAP_MB" \
+  --rootfs "$DISK_STORAGE:${ROOTFS_SIZE}" \
+  --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
+  --unprivileged 1 \
+  --features nesting=1,keyctl=1 \
+  --password "$ROOT_PASSWORD" \
+  --start 1
+
+echo
+echo "=== Waiting for container to boot ==="
+sleep 10
+
+echo
+echo "=== Installing base packages ==="
+
+pct exec "$CTID" -- bash -lc '
+set -e
+apt update
+DEBIAN_FRONTEND=noninteractive apt full-upgrade -y
+DEBIAN_FRONTEND=noninteractive apt install -y \
+  curl wget git sudo nano vim ca-certificates gnupg lsb-release \
+  unzip zip jq htop tmux openssh-server build-essential \
+  python3 python3-pip python3-venv
+'
+
+echo
+echo "=== Configuring SSH ==="
+
+if [[ "$ENABLE_ROOT_SSH" =~ ^[Yy]$ ]]; then
+  pct exec "$CTID" -- bash -lc '
+set -e
+sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
+sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
+systemctl enable --now ssh
+systemctl restart ssh
+'
+else
+  pct exec "$CTID" -- bash -lc '
+set -e
+sed -i "s/^#*PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config
+sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
+systemctl enable --now ssh
+systemctl restart ssh
+'
+fi
+
+if [[ "$ENABLE_CONSOLE_AUTOLOGIN" =~ ^[Yy]$ ]]; then
+  echo
+  echo "=== Enabling Proxmox console auto-login as root ==="
+  pct exec "$CTID" -- bash -lc '
+set -e
+mkdir -p /etc/systemd/system/container-getty@1.service.d
+cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<'"'"'EOF'"'"'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud 38400,115200,9600 tty1 linux
+EOF
+systemctl daemon-reload
+systemctl restart container-getty@1.service || true
+'
+fi
+
+echo
+echo "=== Installing GitHub CLI ==="
+
+pct exec "$CTID" -- bash -lc '
+set -e
+mkdir -p -m 755 /etc/apt/keyrings
+wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+  | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+  > /etc/apt/sources.list.d/github-cli.list
+apt update
+DEBIAN_FRONTEND=noninteractive apt install -y gh
+'
+
+echo
+echo "=== Installing Node.js 22 LTS ==="
+
+pct exec "$CTID" -- bash -lc '
+set -e
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+DEBIAN_FRONTEND=noninteractive apt install -y nodejs
+'
+
+echo
+echo "=== Installing Claude Code ==="
+
+pct exec "$CTID" -- bash -lc '
+set -e
+npm install -g @anthropic-ai/claude-code
+'
+
+echo
+echo "=== Installing Docker ==="
+
+pct exec "$CTID" -- bash -lc '
+set -e
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt update
+DEBIAN_FRONTEND=noninteractive apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+'
+
+echo
+echo "=== Creating app user and project directory ==="
+
+pct exec "$CTID" -- bash -lc "
+set -e
+
+if ! id '$APP_USER' >/dev/null 2>&1; then
+  adduser --disabled-password --gecos '' '$APP_USER'
+fi
+
+echo '$APP_USER:$APP_PASSWORD' | chpasswd
+
+usermod -aG sudo,docker '$APP_USER'
+
+echo '$APP_USER ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$APP_USER
+chmod 440 /etc/sudoers.d/$APP_USER
+
+mkdir -p '$APP_DIR'
+chown -R '$APP_USER:$APP_USER' '$APP_DIR'
+"
+
+echo
+echo "=== Setting app-user login folder and Claude alias ==="
+
+pct exec "$CTID" -- bash -lc "
+set -e
+
+cat >> /home/$APP_USER/.bashrc <<'EOF'
+
+# Start in app project folder
+cd $APP_DIR 2>/dev/null || cd ~
+
+# Run Claude Code with dangerous permissions automatically.
+# This only works as a non-root user. Claude blocks this flag as root.
+alias claude='claude --dangerously-skip-permissions'
+EOF
+
+chown '$APP_USER:$APP_USER' /home/$APP_USER/.bashrc
+"
+
+echo
+echo "=== Creating starter project files ==="
+
+HOST_TMP="$(mktemp -d)"
+trap 'rm -rf "$HOST_TMP"' EXIT
+
+mkdir -p "$HOST_TMP/.github/workflows"
+
+cat > "$HOST_TMP/.gitignore" <<'EOF'
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data - do not commit live data
+data/postgres/
+data/uploads/
+data/logs/
+*.sqlite
+*.sqlite3
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker local overrides
+docker-compose.override.yml
+EOF
+
+cat > "$HOST_TMP/.env.example" <<EOF
+APP_NAME=$APP_NAME
+APP_BASE_URL=https://example.com
+SECRET_KEY=change-me
+
+DATABASE_URL=postgresql://app:app_password@db:5432/app
+POSTGRES_DB=app
+POSTGRES_USER=app
+POSTGRES_PASSWORD=change-me
+
+MOCK_MODE=true
+EOF
+
+cat > "$HOST_TMP/README.md" <<EOF
+# $APP_NAME
+
+Self-hosted app project.
+
+## Rebuild Goal
+
+This repository should contain everything needed to rebuild the app in a fresh LXC container.
+
+Do not commit:
+
+- .env
+- database files
+- uploaded media
+- logs
+
+## Recommended Install Path
+
+$APP_DIR
+
+## First Manual Steps
+
+SSH into the container as the app user:
+
+\`\`\`bash
+ssh $APP_USER@CONTAINER_IP
+\`\`\`
+
+Authenticate GitHub CLI:
+
+\`\`\`bash
+gh auth login
+\`\`\`
+
+Generate Claude Code OAuth token:
+
+\`\`\`bash
+claude setup-token
+\`\`\`
+
+Set GitHub Actions secret:
+
+\`\`\`bash
+gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo OWNER/REPO
+\`\`\`
+EOF
+
+cat > "$HOST_TMP/docker-compose.yml" <<'EOF'
+services:
+  app:
+    build: .
+    container_name: app
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8000"
+    volumes:
+      - ./data/uploads:/app/data/uploads
+      - ./data/logs:/app/data/logs
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    container_name: app-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+EOF
+
+cat > "$HOST_TMP/.github/workflows/claude.yml" <<'EOF'
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+EOF
+
+pct exec "$CTID" -- bash -lc "
+set -e
+mkdir -p '$APP_DIR'
+mkdir -p '$APP_DIR/app' '$APP_DIR/docs' '$APP_DIR/scripts' '$APP_DIR/deploy' '$APP_DIR/data/postgres' '$APP_DIR/data/uploads' '$APP_DIR/data/logs' '$APP_DIR/.github/workflows'
+chown -R '$APP_USER:$APP_USER' '$APP_DIR'
+"
+
+pct push "$CTID" "$HOST_TMP/.gitignore" "$APP_DIR/.gitignore" --perms 0644
+pct push "$CTID" "$HOST_TMP/.env.example" "$APP_DIR/.env.example" --perms 0644
+pct push "$CTID" "$HOST_TMP/README.md" "$APP_DIR/README.md" --perms 0644
+pct push "$CTID" "$HOST_TMP/docker-compose.yml" "$APP_DIR/docker-compose.yml" --perms 0644
+pct push "$CTID" "$HOST_TMP/.github/workflows/claude.yml" "$APP_DIR/.github/workflows/claude.yml" --perms 0644
+
+pct exec "$CTID" -- bash -lc "
+set -e
+chown -R '$APP_USER:$APP_USER' '$APP_DIR'
+"
+
+echo
+echo "=== Initializing Git repo ==="
+
+pct exec "$CTID" -- su - "$APP_USER" -c "
+set -e
+cd '$APP_DIR'
+
+if [ ! -d .git ]; then
+  git init
+  git branch -M main
+fi
+
+if [ -n '$REPO_URL' ]; then
+  if git remote get-url origin >/dev/null 2>&1; then
+    git remote set-url origin '$REPO_URL'
+  else
+    git remote add origin '$REPO_URL'
+  fi
+fi
+
+git config --global user.name '$GIT_NAME'
+git config --global user.email '$GIT_EMAIL'
+"
+
+echo
+echo "=== Checking versions ==="
+
+pct exec "$CTID" -- bash -lc '
+set +e
+echo "git:      $(git --version 2>/dev/null)"
+echo "gh:       $(gh --version 2>/dev/null | head -n1)"
+echo "node:     $(node --version 2>/dev/null)"
+echo "npm:      $(npm --version 2>/dev/null)"
+echo "claude:   $(claude --version 2>/dev/null)"
+echo "docker:   $(docker --version 2>/dev/null)"
+echo "compose:  $(docker compose version 2>/dev/null)"
+echo "tmux:     $(tmux -V 2>/dev/null)"
+'
+
+IP="$(pct exec "$CTID" -- bash -lc "hostname -I | awk '{print \$1}'" | tr -d '\r')"
+
+echo
+echo "===================================================="
+echo " COMPLETE"
+echo "===================================================="
+echo "Container ID:       $CTID"
+echo "Hostname:           $HOSTNAME"
+echo "IP:                 $IP"
+echo "App user:           $APP_USER"
+echo "App directory:      $APP_DIR"
+echo
+echo "SSH as app user:"
+echo "  ssh $APP_USER@$IP"
+echo
+if [[ "$ENABLE_ROOT_SSH" =~ ^[Yy]$ ]]; then
+  echo "SSH as root:"
+  echo "  ssh root@$IP"
+  echo
+fi
+echo "Manual next steps inside the container:"
+echo "  gh auth login"
+echo "  claude setup-token"
+echo "  gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo OWNER/REPO"
+echo
+echo "Then commit starter files:"
+echo "  cd $APP_DIR"
+echo "  git status"
+echo "  git add ."
+echo "  git commit -m \"Initial project structure\""
+echo "  git push -u origin main"
+echo
+echo "SECURITY WARNING:"
+echo "This is a convenience dev container. Do not expose password SSH to the public internet."
