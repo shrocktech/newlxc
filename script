@@ -178,7 +178,7 @@ echo "It will ask for:"
 echo "  - Container ID"
 echo "  - App name"
 echo "  - Optional GitHub repo URL"
-echo "  - Passwords"
+echo "  - Passwords (optional)"
 echo
 echo "It will install:"
 echo "  - Docker"
@@ -250,7 +250,15 @@ ROOTFS_SIZE="$(prompt_default "Disk size in GB" "20")"
 
 section "Passwords"
 
-ROOT_PASSWORD="$(prompt_secret_confirmed "Root password for container")"
+ROOT_PASSWORD=""
+if yes_no_default_no "Set a root password?"; then
+  ROOT_PASSWORD="$(prompt_secret_confirmed "Root password for container")"
+else
+  # Generate a random password for the Proxmox API requirement
+  # (root won't be able to log in without console auto-login)
+  ROOT_PASSWORD="$(openssl rand -base64 32)"
+  info "Root password set to random value (not usable for login)."
+fi
 
 echo
 if yes_no_default_yes "Use the same password for app user '$APP_USER'?"; then
