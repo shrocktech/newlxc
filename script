@@ -144,6 +144,13 @@ make_linux_username() {
   echo "$user" | cut -c1-31
 }
 
+# Convert app slug to git-friendly name (e.g., openhands -> open.hands)
+make_git_name() {
+  local slug="$1"
+  # Insert dots before capital letters or keep slug as-is with dots for separation
+  echo "$slug" | sed 's/-/./g'
+}
+
 yes_no_default_yes() {
   local prompt="$1"
   local value=""
@@ -160,6 +167,27 @@ yes_no_default_no() {
 
   read -rp "$prompt [y/N]: " value
   value="${value:-N}"
+
+  [[ "$value" =~ ^[Yy]$ ]]
+}
+
+yes_no_default_yes_short() {
+  local prompt="$1"
+  local value=""
+
+  read -rp "$prompt [Y/n]: " value
+  value="${value:-Y}"
+
+  [[ "$value" =~ ^[Yy]$ ]]
+}
+
+# Accept Enter as yes or n as no
+yes_no_enter_accepts() {
+  local prompt="$1"
+  local value=""
+
+  read -rp "$prompt [Y/n]: " value
+  value="${value:-Y}"
 
   [[ "$value" =~ ^[Yy]$ ]]
 }
@@ -202,7 +230,7 @@ require_cmd pveam
 section "Basic Container Details"
 
 read -rp "Container ID, example 132: " CTID
-read -rp "App name, example myapp: " APP_NAME
+read -rp "App name, example OpenHands: " APP_NAME
 read -rp "GitHub repo URL, optional, example https://github.com/OWNER/REPO.git: " REPO_URL
 
 if [[ ! "$CTID" =~ ^[0-9]+$ ]]; then
@@ -292,12 +320,22 @@ fi
 
 section "Git Identity"
 
+# Generate default git name from app slug (e.g., openhands -> open.hands)
+DEFAULT_GIT_NAME="$(make_git_name "$APP_SLUG")"
+DEFAULT_GIT_EMAIL="technology@shrockservices.com"
+
 echo "This only sets Git commit identity inside the new container."
 echo "Leave defaults or type your own."
 echo
 
-GIT_NAME="$(prompt_default "Git user.name" "devuser")"
-GIT_EMAIL="$(prompt_default "Git user.email" "dev@example.com")"
+GIT_NAME="$(prompt_default "Git user.name" "$DEFAULT_GIT_NAME")"
+
+echo
+if yes_no_enter_accepts "Use email $DEFAULT_GIT_EMAIL?"; then
+  GIT_EMAIL="$DEFAULT_GIT_EMAIL"
+else
+  GIT_EMAIL="$(prompt_default "Git user.email" "dev@example.com")"
+fi
 
 # -----------------------------
 # Confirmation
@@ -326,9 +364,9 @@ echo "Git name:           ${BOLD}$GIT_NAME${RESET}"
 echo "Git email:          ${BOLD}$GIT_EMAIL${RESET}"
 echo
 
-read -rp "Continue? Type yes: " CONFIRM
-
-if [[ "$CONFIRM" != "yes" ]]; then
+if yes_no_enter_accepts "Continue?"; then
+  : # continue
+else
   warn "Cancelled."
   exit 1
 fi
