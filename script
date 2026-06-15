@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -853,4 +852,3 @@ echo "  git push -u origin main"
 echo
 
 warn "Security reminder: this is a convenience dev container. Do not expose password SSH to the public internet."
-```
